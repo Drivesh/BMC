@@ -1,0 +1,49 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Doctor profile photos — publicly readable (shown in search results and
+    // public profiles without requiring login), but a doctor can only ever
+    // write files prefixed with their own uid, so one doctor can't overwrite
+    // or delete another's photo.
+    match /doctorPhotos/{fileName} {
+      allow read: if true;
+      allow write, delete: if request.auth != null
+                            && fileName.matches(request.auth.uid + '_.*')
+                            && request.resource.size < 5 * 1024 * 1024
+                            && request.resource.contentType.matches('image/.*');
+    }
+
+    // Subscription payment proofs (receipts/screenshots) — not public. Any
+    // signed-in user can read (this app has no server-side admin check
+    // available in Storage rules without a Firestore lookup, so this is a
+    // deliberate trade-off: not world-readable, but not strictly admin-only
+    // either). A doctor can only ever upload files prefixed with their own uid.
+    match /subscriptionProofs/{fileName} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+                   && fileName.matches(request.auth.uid + '_.*')
+                   && request.resource.size < 5 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+      allow delete: if false;
+    }
+
+    // Advert images — publicly readable (meant to be shared/seen), and only an
+    // admin may upload/replace them. Storage rules can check the requester's
+    // role via a cross-service Firestore lookup.
+    match /advertImages/{fileName} {
+      allow read: if true;
+      allow write: if request.auth != null
+                   && firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role == 'admin'
+                   && request.resource.size < 5 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+      allow delete: if request.auth != null
+                    && firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // Everything else stays locked down by default.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

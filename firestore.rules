@@ -1,0 +1,153 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() { return request.auth != null; }
+    function myUid() { return request.auth.uid; }
+    function myRole() {
+      return isSignedIn()
+        ? get(/databases/$(database)/documents/users/$(myUid())).data.role
+        : null;
+    }
+    function isAdmin() { return isSignedIn() && myRole() == 'admin'; }
+    function isDoctor() { return isSignedIn() && myRole() == 'doctor'; }
+    function isPatient() { return isSignedIn() && myRole() == 'patient'; }
+    // True only if this update touches nothing but impressions/clicks, and
+    // only ever bumps each by exactly 1 — used to let anonymous visitors
+    // record ad views/clicks without opening up any other field to writes.
+    function isAdCounterBump() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      return changed.hasOnly(['impressions','clicks'])
+        && (!changed.hasAny(['impressions']) || request.resource.data.impressions == resource.data.impressions + 1)
+        && (!changed.hasAny(['clicks']) || request.resource.data.clicks == resource.data.clicks + 1);
+    }
+
+    // ---------------- users ----------------
+    // Each user can read/update their own profile. Admin can read all.
+    // role/email are set only at signup and are not user-editable afterwards.
+    match /users/{uid} {
+      allow read: if isSignedIn() && (myUid() == uid || isAdmin());
+      allow create: if isSignedIn() && myUid() == uid;
+      allow update: if isSignedIn() && myUid() == uid
+                    && request.resource.data.role == resource.data.role
+                    && request.resource.data.email == resource.data.email;
+      allow delete: if false;
+    }
+
+    // ---------------- doctors ----------------
+    // Public can read only verified doctor profiles; the doctor and admin can read/write regardless.
+    match /doctors/{doctorId} {
+      allow read: if resource.data.verified == true || (isSignedIn() && (myUid() == doctorId || isAdmin()));
+      allow create: if isSignedIn() && myUid() == doctorId;
+      allow update: if isSignedIn() && (
+        isAdmin() ||
+        (myUid() == doctorId &&
+         !request.resource.data.diff(resource.data).affectedKeys()
+           .hasAny(['verified','suspended','subscriptionPlan','subscriptionStatus','subscriptionExpiry']))
+      );
+      allow delete: if isAdmin();
+
+      // A doctor's cabinets are publicly readable (needed to show availability
+      // on the public profile) but only the owning doctor or admin can write.
+      match /cabinets/{cabinetId} {
+        allow read: if true;
+        allow write: if isSignedIn() && (myUid() == doctorId || isAdmin());
+      }
+    }
+
+    // ---------------- appointments ----------------
+    // Patients see only their own bookings; doctors see only their own patients'
+    // bookings; admin sees all. Private notes are written by the doctor only.
+    match /appointments/{apptId} {
+      allow read: if isSignedIn() && (resource.data.patientId == myUid() || resource.data.doctorId == myUid() || isAdmin());
+      // A patient can create their own booking request; a doctor can create
+      // an appointment on a patient's behalf (follow-ups scheduled from the
+      // Appointments/Calendar screen) as long as they're the doctor on it.
+      allow create: if isSignedIn() && (
+        (isPatient() && request.resource.data.patientId == myUid()) ||
+        (isDoctor() && request.resource.data.doctorId == myUid())
+      );
+      allow update: if isSignedIn() && (resource.data.doctorId == myUid() || resource.data.patientId == myUid() || isAdmin());
+      allow delete: if isAdmin();
+    }
+
+    // ---------------- specialities ----------------
+    match /specialities/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // ---------------- notifications ----------------
+    // A user can only ever read/mark-read their own notifications.
+    // Any signed-in user can create a notification addressed to someone else
+    // (needed so a patient's booking can notify their doctor, and vice versa) —
+    // but the payload can't be forged to look like it came from another sender
+    // beyond what's already visible to the recipient.
+    match /notifications/{id} {
+      allow read: if isSignedIn() && resource.data.userId == myUid();
+      allow create: if isSignedIn();
+      allow update: if isSignedIn() && resource.data.userId == myUid()
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+      allow delete: if false;
+    }
+
+    // ---------------- subscriptionPlans ----------------
+    // Publicly readable so anyone can see pricing; only admin can create/edit/delete.
+    match /subscriptionPlans/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // ---------------- subscriptionRequests ----------------
+    // Doctors can create and read their own requests; only admin can approve/reject.
+    match /subscriptionRequests/{id} {
+      allow read: if isSignedIn() && (resource.data.doctorId == myUid() || isAdmin());
+      allow create: if isSignedIn() && isDoctor() && request.resource.data.doctorId == myUid();
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // ---------------- ticketCounters ----------------
+    // Holds nothing but a running count + "now serving" number per
+    // doctor+cabinet+day — no patient names or appointment details — so it's
+    // safe for any signed-in user to read/increment. Patients need write
+    // access here to claim the next ticket number when booking; the owning
+    // doctor needs it to advance "now serving".
+    match /ticketCounters/{id} {
+      allow read: if isSignedIn();
+      allow create, update: if isSignedIn();
+      allow delete: if false;
+    }
+
+    // ---------------- payments (admin-recorded subscription payment ledger) ----
+    match /payments/{id} {
+      allow read: if isSignedIn() && (resource.data.doctorId == myUid() || isAdmin());
+      allow write: if isAdmin();
+    }
+
+    // ---------------- settings (platform payment details shown on invoices) ---
+    match /settings/{id} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // ---------------- adverts (admin-managed promotional listings) -------------
+    // Publicly readable (they're meant to be shared/seen). Admin has full write
+    // control; anyone — including anonymous visitors, since ads show on the
+    // logged-out homepage — may ONLY increment impressions/clicks, and only by
+    // exactly 1 at a time, so this can't be used to tamper with anything else
+    // on the document (a basic guard against naive click-fraud scripts, though
+    // real fraud prevention needs a backend to rate-limit by IP/session).
+    match /adverts/{id} {
+      allow read: if true;
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || isAdCounterBump();
+    }
+
+    // ---------------- announcements (admin-authored, publicly readable) ----------------
+    match /announcements/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+  }
+}

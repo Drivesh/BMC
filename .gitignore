@@ -1,0 +1,18 @@
+# Firebase Admin SDK service account key — NEVER commit this.
+# It grants full read/write access to your entire Firebase project.
+seed/serviceAccountKey.json
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Firebase local state
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
